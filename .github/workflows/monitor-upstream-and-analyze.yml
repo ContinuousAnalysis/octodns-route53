@@ -1,0 +1,189 @@
+name: Monitor Upstream and Run Analysis
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      start_commit:
+        description: "Start commit SHA"
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+jobs:
+  monitor-upstream:
+    runs-on: ubuntu-latest
+    env:
+      # NEED TO BE CONFIGURED EACH PROJECT
+      UPSTREAM_REPO: "octodns/octodns-route53"
+      BRANCH: "main"
+      DELAY_BETWEEN_DISPATCHES: 300 # 5 minutes
+
+    steps:
+      - name: Checkout the forked repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: forked-repo
+
+      - name: Sync fork with upstream
+        run: |
+          # Change to the forked repo directory
+          cd forked-repo
+
+          # Set the user name and email for the git commands
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          # Add the upstream repo as a remote and fetch it
+          git remote add upstream https://github.com/${UPSTREAM_REPO}.git || true
+          git fetch upstream
+
+          # Checkout the branch and merge the upstream branch
+          git checkout ${{ env.BRANCH }}
+
+          # Try to rebase the branch
+          git rebase upstream/${{ env.BRANCH }} || {
+            echo "Rebase failed, trying to merge with --allow-unrelated-histories"
+            git merge upstream/${{ env.BRANCH }} --allow-unrelated-histories
+          }
+
+          # Push the merged changes back to the forked repo
+          git push --force-with-lease origin ${{ env.BRANCH }}
+
+          # Change back to the root directory
+          cd ..
+
+      - name: Clean up the workspace
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/forked-repo"
+
+      - name: Prepare and restore cache folder
+        id: cache-folder
+        uses: actions/cache/restore@v4
+        with:
+          path: .continuous-analysis-cache
+          key: continuous-analysis-cache-${{ github.repository }}-
+
+      - name: Create cache folder if not exists
+        run: |
+          mkdir -p .continuous-analysis-cache
+
+      - name: Load last seen SHA from cache folder
+        id: last-sha
+        run: |
+          # If start_commit is provided, set it as the last seen SHA
+          if [[ -n "${{ inputs.start_commit }}" ]]; then
+            echo "last_sha=${{ inputs.start_commit }}" >> $GITHUB_OUTPUT
+            echo "Start commit provided: ${{ inputs.start_commit }}"
+            exit 0
+          fi
+
+          # Declare the file path to the last seen SHA
+          FILE=".continuous-analysis-cache/last_sha.txt"
+
+          # Check if the file exists and load the last seen SHA
+          if [[ -f "$FILE" ]]; then
+            LAST_SHA=$(cat "$FILE")
+            echo "Last seen SHA found in cache: $LAST_SHA"
+          else
+            LAST_SHA=""
+            echo "No last seen SHA found in cache"
+          fi
+
+          # Output the last seen SHA to the GitHub Actions output for further use
+          echo "last_sha=$LAST_SHA" >> $GITHUB_OUTPUT
+
+      - name: Get upstream commits and find new ones
+        id: check-commits
+        run: |
+          # Print the upstream repo and branch to the console
+          echo "Finding the latest 50 commits from the upstream repo: $UPSTREAM_REPO@$BRANCH"
+
+          # Get the latest 50 commits from the upstream repo and save them to a JSON file
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/commits?sha=${BRANCH}&per_page=50" \
+              > commits.json
+
+          # Parse the first commit SHA from the JSON file for sanity check
+          if ! jq -e '.[0].sha' commits.json > /dev/null; then
+            echo "Failed to parse SHA from commits.json"
+            exit 1
+          fi
+
+          # Parse all commit SHAs (from newest to oldest) from the JSON file and save to all_commits.txt
+          jq -r '.[].sha' commits.json > all_commits.txt
+
+          # Get the last seen SHA from the previous step
+          LAST_SEEN="${{ steps.last-sha.outputs.last_sha }}"
+          echo "Last seen SHA: $LAST_SEEN"
+
+          # If the last seen SHA is empty, select the latest commit SHA
+          if [[ -z "$LAST_SEEN" ]]; then
+            head -n 1 all_commits.txt > new_commits.txt
+            echo "has_new_commits=true" >> $GITHUB_OUTPUT
+            echo "First-time run — selecting the latest commit: $(head -n 1 all_commits.txt)"
+          else
+            # If the last seen SHA is not empty, filter out previously seen commits
+            # Print all new commit SHAs (above the last seen SHA) to new_commits.txt
+            awk -v sha="$LAST_SEEN" '$0 ~ sha {exit} {print}' all_commits.txt > new_commits.txt
+
+            if [ ! -s new_commits.txt ]; then
+              echo "No new commits to process."
+              echo "has_new_commits=false" >> $GITHUB_OUTPUT
+            else
+              echo "New commits to process:"
+              echo "has_new_commits=true" >> $GITHUB_OUTPUT
+              cat new_commits.txt
+            fi
+          fi
+
+      - name: Trigger analysis workflows for new commits sequentially
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Read the commits from file
+          mapfile -t commits < new_commits.txt
+      
+          if [ ${#commits[@]} -eq 0 ]; then
+            echo "No new commits to process"
+            exit 0
+          fi
+      
+          for commit in $(tac new_commits.txt); do
+            echo "Dispatching workflow for commit: $commit"
+      
+            gh workflow run run-analysis.yml \
+              --repo "${GITHUB_REPOSITORY}" \
+              --ref "${{ env.BRANCH }}" \
+              --field commit="$commit"
+      
+            echo "Sleeping for $DELAY_BETWEEN_DISPATCHES seconds before next dispatch..."
+            sleep $DELAY_BETWEEN_DISPATCHES
+          done
+
+      - name: Update SHA cache
+        if: steps.check-commits.outputs.has_new_commits == 'true'
+        run: |
+          NEWEST=$(head -n 1 new_commits.txt)
+          echo "$NEWEST" > .continuous-analysis-cache/last_sha.txt
+
+      - name: Generate timestamp
+        if: steps.check-commits.outputs.has_new_commits == 'true'
+        id: timestamp
+        run: |
+          ts=$(date +'%Y%m%d-%H%M')
+          echo "ts=$ts" >> "$GITHUB_OUTPUT"
+          echo "Generated timestamp: $ts"
+
+      - name: Save updated SHA cache with timestamp
+        if: steps.check-commits.outputs.has_new_commits == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .continuous-analysis-cache
+          key: continuous-analysis-cache-${{ github.repository }}-${{ steps.timestamp.outputs.ts }}
