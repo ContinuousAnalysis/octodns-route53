@@ -29,7 +29,7 @@ jobs:
       BRANCH: "main"
       RUNNER_DISPATCH_TIMEOUT: 1800 # 1 hour
       FILTER_DISPATCH_TIMEOUT: 600 # 10 minutes
-      MAX_CONCURRENT: 7
+      MAX_CONCURRENT: 8
 
     steps:
       - name: Checkout the forked repo
@@ -214,6 +214,8 @@ jobs:
 
             if [ ! -s temp_new_commits.txt ]; then
               echo "No new commits to process."
+              rm -f temp_new_commits.txt
+              touch new_commits.txt  # Create empty file for consistency
               echo "has_new_commits=false" >> $GITHUB_OUTPUT
             else
               if [[ "$SKIP_COMMITS" -eq 0 ]]; then
@@ -223,6 +225,7 @@ jobs:
               else
                 # Skip pattern: select every (SKIP_COMMITS + 1)th commit from new commits
                 awk "NR % ($SKIP_COMMITS + 1) == 1" temp_new_commits.txt > new_commits.txt
+                rm -f temp_new_commits.txt  # Clean up temp file
                 echo "New commits to process (skip pattern - every $(($SKIP_COMMITS + 1))th commit):"
               fi
               echo "has_new_commits=true" >> $GITHUB_OUTPUT
@@ -244,6 +247,7 @@ jobs:
           fi
 
       - name: Trigger analysis workflows for new commits in parallel
+        if: steps.check-commits.outputs.has_new_commits == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -377,6 +381,7 @@ jobs:
           echo "All ${total_commits} workflows completed successfully across all batches!"
 
       - name: Trigger violation filter workflows for new commits in sequence
+        if: steps.check-commits.outputs.has_new_commits == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
