@@ -1,3 +1,11 @@
+## 1.2.0 - 2026-06-29
+
+Minor:
+* Quick pass at migrating to Validators, backwards compat - [#133](https://github.com/octodns/octodns-route53/pull/133)
+
+Patch:
+* Sanitize invalid characters in health check tag names to support wildcard DNS records - [#136](https://github.com/octodns/octodns-route53/pull/136)
+
 ## 1.1.0 - 2026-04-03
 
 Minor:
